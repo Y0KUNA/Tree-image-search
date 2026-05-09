@@ -9,6 +9,7 @@
     <div>
       <h3>Query image</h3>
       <img src="{{ url_for('uploaded_file', filename=query_image[1]) }}" alt="query" style="max-width:300px;" />
+     
     </div>
     <div>
       <h3>Top matches</h3>
@@ -16,7 +17,7 @@
       {% for r in results %}
         <li>
           <img src="{{ url_for('data_clean_file', filename=r.relpath) }}" style="max-width:200px;" />
-          <div>{{ r.folder }}/{{ r.file_name }} — distance: {{ '%.4f'|format(r.distance) }}</div>
+          <div>{{ r.folder }}/{{ r.file_name }} — Độ tương đồng: {{ r.similarity }}%</div>
         </li>
       {% endfor %}
       </ol>

@@ -3,3 +3,4 @@ numpy
 pandas
 scikit-image
 tqdm
+psycopg2

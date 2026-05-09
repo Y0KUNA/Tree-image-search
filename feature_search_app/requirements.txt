@@ -1,3 +1,4 @@
-Flask
+customtkinter
 numpy
 pandas
+scikit-learn
