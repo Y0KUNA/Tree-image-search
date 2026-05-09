@@ -26,14 +26,14 @@ DATA_CLEAN = (APP_ROOT / '..' / 'Data_clean').resolve()
 DB_CONFIG = {
     'host':     'localhost',
     'port':     5432,
-    'dbname':   'Tree_image_metadata',   # ← đổi
-    'user':     'postgres',   # ← đổi
-    'password': '12345678',   # ← đổi
+    'dbname':   'Tree_image_metadata',
+    'user':     'postgres',
+    'password': '12345678',
 }
 
-# ── Appearance ─────────────────────────────────────────────────────────────────
 ctk.set_appearance_mode('light')
 ctk.set_default_color_theme('green')
+
 
 # ── Feature helpers ────────────────────────────────────────────────────────────
 
@@ -53,21 +53,63 @@ def get_feature_cols(df: pd.DataFrame) -> list:
     return [c for c in df.columns if c not in ('id', 'file_name', 'folder')]
 
 
-def find_top_k(query_vec: np.ndarray, df: pd.DataFrame, k: int = 5) -> List[dict]:
-    cols = get_feature_cols(df)
-    mat = df[cols].values.astype(float)
+def build_query_vec(dest: Path, df: pd.DataFrame, feature_cols: list) -> tuple[np.ndarray, bool]:
+    # Lấy folder từ đường dẫn (parent directory name)
+    folder = dest.parent.name
 
-    scaler = StandardScaler()
-    mat_scaled = scaler.fit_transform(mat)
+    # Match cả tên file lẫn folder
+    matched = df[(df['file_name'] == dest.name) & (df['folder'] == folder)]
+
+    # Nếu không tìm được theo folder, fallback theo tên file
+    if matched.empty:
+        matched = df[df['file_name'] == dest.name]
+
+    if not matched.empty:
+        return matched.iloc[0][feature_cols].values.astype(float), True
+
+    feats = process_image(dest)
+    return np.array([feats[c] for c in feature_cols], dtype=float), False
+
+
+def find_top_k(
+    query_path: Path,
+    query_vec: np.ndarray,
+    in_db: bool,
+    df: pd.DataFrame,
+    scaler: StandardScaler,
+    mat_scaled: np.ndarray,
+    feature_cols: list,
+    k: int = 5,
+) -> List[dict]:
+    """
+    Pipeline:
+      1. Scale vector query bằng scaler đã fit trên toàn bộ DB.
+      2. Tính cosine similarity với ma trận đã scale.
+      3. Loại chính ảnh query (nếu có trong DB) bằng tên file — chính xác hơn
+         so với dùng ngưỡng similarity.
+      4. Sắp xếp giảm dần, lấy top-k.
+    """
+    # Bước 1 — scale query
     query_scaled = scaler.transform(query_vec.reshape(1, -1))
 
+    # Bước 2 — tính similarity
     sims = cosine_similarity(query_scaled, mat_scaled)[0]
 
-    eps = 1e-9
-    valid_idx = np.where(sims < 1.0 - eps)[0]
+    # Bước 3 — loại ảnh query khỏi kết quả (dùng tên file, không dùng ngưỡng)
+    if in_db:
+        folder = query_path.parent.name
+        exclude_mask = (
+            (df['file_name'].values == query_path.name) &
+            (df['folder'].values == folder)
+        )
+        valid_idx = np.where(~exclude_mask)[0]
+    else:
+        valid_idx = np.arange(len(sims))
+
     if valid_idx.size == 0:
         valid_idx = np.arange(len(sims))
 
+    # Bước 4 — sắp xếp và lấy top-k
     sorted_valid = valid_idx[np.argsort(-sims[valid_idx])]
     top_idx = sorted_valid[:k]
 
@@ -75,21 +117,12 @@ def find_top_k(query_vec: np.ndarray, df: pd.DataFrame, k: int = 5) -> List[dict
     for i in top_idx:
         r = df.iloc[int(i)]
         results.append({
-            'file_name': r['file_name'],
-            'folder':    r['folder'],
+            'file_name':  r['file_name'],
+            'folder':     r['folder'],
             'similarity': round(float(sims[i]) * 100, 2),
-            'path': DATA_CLEAN / r['folder'] / r['file_name'],
+            'path':       DATA_CLEAN / r['folder'] / r['file_name'],
         })
     return results
-
-
-def build_query_vec(dest: Path, df: pd.DataFrame) -> np.ndarray:
-    cols = get_feature_cols(df)
-    matched = df[df['file_name'] == dest.name]
-    if not matched.empty:
-        return matched.iloc[0][cols].values.astype(float)
-    feats = process_image(dest)
-    return np.array([feats[c] for c in cols], dtype=float)
 
 
 # ── GUI ────────────────────────────────────────────────────────────────────────
@@ -140,11 +173,15 @@ class App(ctk.CTk):
         self.geometry('1200x750')
         self.resizable(True, True)
 
-        self.df = pd.DataFrame()
+        self.df            = pd.DataFrame()
+        self.scaler:       StandardScaler | None = None
+        self.mat_scaled:   np.ndarray | None     = None
+        self.feature_cols: list                  = []
+
         self._selected_path: Path | None = None
+        self._query_in_db:   bool        = False
 
         self._build_ui()
-        # Tải DB sau khi UI sẵn sàng
         threading.Thread(target=self._load_db, daemon=True).start()
 
     # ── Build UI ───────────────────────────────────────────────────────────────
@@ -160,7 +197,7 @@ class App(ctk.CTk):
         body = ctk.CTkFrame(self, fg_color='transparent')
         body.pack(fill='both', expand=True, padx=20, pady=16)
 
-        # Left panel
+        # ── Left panel ─────────────────────────────────────────────────────────
         left = ctk.CTkFrame(body, width=270, corner_radius=12)
         left.pack(side='left', fill='y', padx=(0, 16))
         left.pack_propagate(False)
@@ -171,7 +208,7 @@ class App(ctk.CTk):
         self.query_img_label = ctk.CTkLabel(
             left, text='Chưa chọn ảnh\n\nNhấn "Chọn ảnh"\nđể bắt đầu',
             width=220, height=220, fg_color='#e8f5e9', corner_radius=8,
-            font=ctk.CTkFont(size=11), text_color='#888'
+            font=ctk.CTkFont(size=11), text_color='#888',
         )
         self.query_img_label.pack(pady=(0, 8))
 
@@ -179,25 +216,27 @@ class App(ctk.CTk):
                                        text_color='#666', wraplength=240)
         self.file_label.pack()
 
-        ctk.CTkButton(left, text='📂  Chọn ảnh', command=self._pick_image,
-                      height=38, font=ctk.CTkFont(size=12, weight='bold'),
-                      fg_color='#2e7d32', hover_color='#1b5e20',
-                      corner_radius=8).pack(pady=(12, 6), padx=16, fill='x')
+        ctk.CTkButton(
+            left, text='📂  Chọn ảnh', command=self._pick_image,
+            height=38, font=ctk.CTkFont(size=12, weight='bold'),
+            fg_color='#2e7d32', hover_color='#1b5e20', corner_radius=8,
+        ).pack(pady=(12, 6), padx=16, fill='x')
 
         self.search_btn = ctk.CTkButton(
             left, text='🔍  Tìm kiếm', command=self._search,
             height=38, font=ctk.CTkFont(size=12, weight='bold'),
             fg_color='#1565c0', hover_color='#0d47a1',
-            corner_radius=8, state='disabled'
+            corner_radius=8, state='disabled',
         )
         self.search_btn.pack(padx=16, fill='x')
 
-        self.status_label = ctk.CTkLabel(left, text='Đang kết nối database...',
-                                         font=ctk.CTkFont(size=10),
-                                         text_color='#888', wraplength=240)
+        self.status_label = ctk.CTkLabel(
+            left, text='Đang kết nối database...',
+            font=ctk.CTkFont(size=10), text_color='#888', wraplength=240,
+        )
         self.status_label.pack(pady=(10, 0))
 
-        # Right panel
+        # ── Right panel ────────────────────────────────────────────────────────
         right = ctk.CTkFrame(body, fg_color='transparent')
         right.pack(side='left', fill='both', expand=True)
 
@@ -211,23 +250,38 @@ class App(ctk.CTk):
     # ── DB loading ─────────────────────────────────────────────────────────────
 
     def _load_db(self):
-        """Chạy trong thread riêng — tải DB không làm đơ UI."""
+        """
+        Chạy trong thread riêng.
+        Fit StandardScaler một lần duy nhất trên toàn bộ DB,
+        cache mat_scaled để không tính lại mỗi lần search.
+        """
         self.after(0, lambda: self.status_label.configure(text='Đang tải dữ liệu...'))
         df = load_features()
         self.df = df
+
         if df.empty:
             self.after(0, lambda: self.status_label.configure(
                 text='❌ Không tải được dữ liệu', text_color='red'))
-        else:
-            self.after(0, lambda: self.status_label.configure(
-                text=f'✅ Đã tải {len(df)} ảnh từ DB', text_color='#2e7d32'))
+            return
+
+        # Bước 3 trong pipeline: fit scaler trên toàn DB, cache kết quả
+        cols = get_feature_cols(df)
+        self.feature_cols = cols
+        mat = df[cols].values.astype(float)
+
+        scaler = StandardScaler()
+        self.mat_scaled = scaler.fit_transform(mat)   # shape (n_images, 42)
+        self.scaler     = scaler                      # giữ để transform query sau này
+
+        self.after(0, lambda: self.status_label.configure(
+            text=f'✅ Đã tải {len(df)} ảnh từ DB', text_color='#2e7d32'))
 
     # ── Actions ────────────────────────────────────────────────────────────────
 
     def _pick_image(self):
         path = filedialog.askopenfilename(
             title='Chọn ảnh cây',
-            filetypes=[('Image files', '*.jpg *.jpeg *.png *.bmp *.tif *.tiff')]
+            filetypes=[('Image files', '*.jpg *.jpeg *.png *.bmp *.tif *.tiff')],
         )
         if not path:
             return
@@ -239,7 +293,7 @@ class App(ctk.CTk):
             img.thumbnail(THUMB_QUERY, Image.LANCZOS)
             ctk_img = ctk.CTkImage(light_image=img, size=img.size)
             self.query_img_label.configure(image=ctk_img, text='')
-            self._query_img_ref = ctk_img
+            self._query_img_ref = ctk_img          # giữ reference tránh GC
         except Exception as e:
             self.query_img_label.configure(text=f'Không đọc được ảnh\n{e}')
 
@@ -249,20 +303,32 @@ class App(ctk.CTk):
     def _search(self):
         if self._selected_path is None:
             return
-        if self.df.empty:
+        if self.df.empty or self.scaler is None:
             messagebox.showerror('Lỗi', 'Chưa có dữ liệu từ database.')
             return
 
         self.search_btn.configure(state='disabled')
         self.status_label.configure(text='Đang tìm kiếm...', text_color='#888')
         self._clear_results()
-
         threading.Thread(target=self._run_search, daemon=True).start()
 
     def _run_search(self):
         try:
-            query_vec = build_query_vec(self._selected_path, self.df)
-            results = find_top_k(query_vec, self.df, k=5)
+            # Bước 1+2: lấy vector thô (từ DB hoặc trích xuất từ file)
+            query_vec, in_db = build_query_vec(
+                self._selected_path, self.df, self.feature_cols)
+
+            # Bước 3+4+5: scale → similarity → loại query → top-k
+            results = find_top_k(
+                query_path  = self._selected_path,
+                query_vec   = query_vec,
+                in_db       = in_db,
+                df          = self.df,
+                scaler      = self.scaler,
+                mat_scaled  = self.mat_scaled,
+                feature_cols= self.feature_cols,
+                k           = 5,
+            )
             self.after(0, lambda: self._show_results(results))
         except Exception as e:
             self.after(0, lambda: messagebox.showerror('Lỗi tìm kiếm', str(e)))
@@ -274,7 +340,6 @@ class App(ctk.CTk):
         for rank, r in enumerate(results, 1):
             card = ResultCard(self.scroll_frame, rank=rank, result=r)
             card.pack(fill='x', pady=6, padx=4)
-
         self.status_label.configure(
             text=f'Tìm thấy {len(results)} kết quả', text_color='#2e7d32')
         self.search_btn.configure(state='normal')
