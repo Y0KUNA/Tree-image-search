@@ -7,7 +7,6 @@ from typing import List
 
 import numpy as np
 import pandas as pd
-import psycopg2
 from PIL import Image
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import StandardScaler
@@ -23,14 +22,6 @@ from feature_extract.extract_features import process_image
 
 DATA_CLEAN = (APP_ROOT / '..' / 'Data_clean').resolve()
 
-DB_CONFIG = {
-    'host':     'localhost',
-    'port':     5432,
-    'dbname':   'Tree_image_metadata',
-    'user':     'postgres',
-    'password': '12345678',
-}
-
 ctk.set_appearance_mode('light')
 ctk.set_default_color_theme('green')
 
@@ -38,15 +29,37 @@ ctk.set_default_color_theme('green')
 # ── Feature helpers ────────────────────────────────────────────────────────────
 
 def load_features() -> pd.DataFrame:
-    """Tải toàn bộ dữ liệu từ PostgreSQL về DataFrame."""
-    try:
-        conn = psycopg2.connect(**DB_CONFIG)
-        df = pd.read_sql('SELECT * FROM plant_features ORDER BY file_name', conn)
-        conn.close()
-        return df
-    except Exception as e:
-        messagebox.showerror('Lỗi kết nối DB', f'Không thể tải dữ liệu từ database:\n{e}')
+    """Load features from normalized_features.csv into a DataFrame.
+
+    Expects the CSV to contain at least 'file_name' and 'folder' columns.
+    """
+    csv_path = (APP_ROOT / '..' / 'feature_extract' / 'normalized_features.csv').resolve()
+    if not csv_path.exists():
+        messagebox.showerror('File not found', f'normalized_features.csv not found at:\n{csv_path}')
         return pd.DataFrame()
+
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception as e:
+        messagebox.showerror('Read error', f'Cannot read CSV {csv_path}:\n{e}')
+        return pd.DataFrame()
+
+    # Validate required key columns
+    if 'file_name' not in df.columns or 'folder' not in df.columns:
+        messagebox.showerror('Invalid CSV', 'normalized_features.csv must contain "file_name" and "folder" columns')
+        return pd.DataFrame()
+
+    # Ensure feature columns are numeric
+    feature_cols = [c for c in df.columns if c not in ('file_name', 'folder')]
+    try:
+        df[feature_cols] = df[feature_cols].apply(pd.to_numeric, errors='raise')
+    except Exception as e:
+        messagebox.showerror('CSV format error', f'Feature columns must be numeric:\n{e}')
+        return pd.DataFrame()
+
+    # Order by file_name to keep deterministic order (like previous DB query)
+    df = df.sort_values('file_name').reset_index(drop=True)
+    return df
 
 
 def get_feature_cols(df: pd.DataFrame) -> list:
