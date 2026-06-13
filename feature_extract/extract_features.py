@@ -11,6 +11,7 @@ import numpy as np
 import psycopg2
 from psycopg2.extras import execute_values
 from skimage.feature import local_binary_pattern
+import pandas as pd
 from tqdm import tqdm
 
 # ── DB Config ──────────────────────────────────────────────────────────────────
@@ -236,11 +237,16 @@ def main() -> None:
 
     batch: List[tuple] = []
     success, failed = 0, 0
+    rows: List[Dict[str, object]] = []
 
     for p, folder in tqdm(images, desc='Processing'):
         try:
             feats = process_image(p)
             batch.append(row_to_tuple(p.name, folder, feats))
+            # also collect a dict for CSV output
+            row = {'file_name': p.name, 'folder': folder}
+            row.update(feats)
+            rows.append(row)
         except Exception as e:
             print(f'\nLỗi {p.name}: {e}')
             failed += 1
@@ -261,6 +267,22 @@ def main() -> None:
 
     cur.close()
     conn.close()
+
+    # write features.csv (overwrite)
+    try:
+        out_csv = Path(__file__).parent / 'features.csv'
+        if rows:
+            df_out = pd.DataFrame(rows)
+            # order columns: file_name, folder, then sorted feature columns
+            cols = [c for c in df_out.columns if c not in ('file_name', 'folder')]
+            cols_sorted = sorted(cols)
+            df_out = df_out[['file_name', 'folder', *cols_sorted]]
+            df_out.to_csv(out_csv, index=False)
+            print(f'Wrote features CSV to {out_csv}')
+        else:
+            print('No rows to write to CSV')
+    except Exception as e:
+        print(f'Failed to write features.csv: {e}')
 
     print(f'\nHoàn thành: {success} ảnh inserted/updated | {failed} lỗi')
 
